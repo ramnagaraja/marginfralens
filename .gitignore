@@ -1,0 +1,14 @@
+.costtool_cache/
+.costtool_cache/
+Archives/
+Azure Cost Logs/
+Webber Cost Logs/
+Zabbix Logs/
+.costtool_cache/
+Archives/
+Azure Cost Logs/
+Webber Cost Logs/
+Zabbix Logs/
+*.csv
+*.xls
+*.xlsx
