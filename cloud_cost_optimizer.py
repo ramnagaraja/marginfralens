@@ -342,6 +342,100 @@ def parse_webber_folder(folder, progress=None):
         S["keys"] = S["host"].map(lambda h: set().union(*[host_keys(x) for x in re.split(r"\s*/\s*", str(h))]))
     return S, D, notes
 # ==============================================================================
+# 2b. SAVED DATA STORE  (one clean copy of all cost and Zabbix files; every save replaces the previous one)
+# ==============================================================================
+STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else ".", "data_store")
+STORE_EXT = {"azure": (".xlsx", ".xlsm", ".xls"), "webber": (".xls", ".xlsx"), "zabbix": (".csv",)}
+STORE_META = os.path.join(STORE_DIR, "saved.json")
+
+
+def store_path(kind):
+    return os.path.join(STORE_DIR, FOLDER_NAMES[kind])
+
+
+def _store_files(kind):
+    d = store_path(kind)
+    return [os.path.join(r, f) for r, _, fs in os.walk(d) for f in fs] if os.path.isdir(d) else []
+
+
+def store_info():
+    """What is saved: file counts, size, when and from where."""
+    import json
+    info = {"ready": True, "kinds": {}, "saved_at": None, "source": ""}
+    for k in FOLDER_NAMES:
+        fl = _store_files(k)
+        info["kinds"][k] = {"files": len(fl), "mb": sum(os.path.getsize(f) for f in fl) / 1e6}
+        info["ready"] = info["ready"] and len(fl) > 0
+    try:
+        with open(STORE_META, encoding="utf-8") as f:
+            m = json.load(f)
+        info["saved_at"], info["source"] = m.get("saved_at"), m.get("source", "")
+    except Exception:
+        pass
+    return info
+
+
+def active_base(input_base):
+    """Saved data when it is complete, otherwise the input folder."""
+    return STORE_DIR if store_info()["ready"] else input_base
+
+
+def store_clear():
+    shutil.rmtree(STORE_DIR, ignore_errors=True)
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)   # parsed copies of the removed files
+
+
+def _store_meta(source):
+    import json
+    os.makedirs(STORE_DIR, exist_ok=True)
+    with open(STORE_META, "w", encoding="utf-8") as f:
+        json.dump({"saved_at": dt.datetime.now().strftime("%d %b %Y %H:%M"), "source": source}, f)
+
+
+def _place(src, dst):
+    """Hard-link when the folders share a drive (no extra disk space), otherwise copy."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def store_from_folder(base):
+    """Replace the saved data with the files of the input folder. Returns (counts, problems)."""
+    if os.path.abspath(base) == os.path.abspath(STORE_DIR):
+        return None, "The input folder is the saved store itself; point it at the folder holding your source files."
+    found = {k: find_dir(base, n) for k, n in FOLDER_NAMES.items()}
+    miss = [FOLDER_NAMES[k] for k, d in found.items() if not d]
+    if miss:
+        return None, "Folder not found: " + ", ".join(miss)
+    pick = {}
+    for k, d in found.items():
+        pick[k] = [os.path.join(r, f) for r, _, fs in os.walk(d) for f in sorted(fs)
+                   if f.lower().endswith(STORE_EXT[k]) and not f.startswith("~$")]
+    if not all(pick.values()):
+        return None, "No usable files in: " + ", ".join(FOLDER_NAMES[k] for k, v in pick.items() if not v)
+    store_clear()
+    for k, fl in pick.items():
+        for f in fl:
+            _place(f, os.path.join(store_path(k), os.path.basename(f)))
+    _store_meta("input folder")
+    return {k: len(v) for k, v in pick.items()}, None
+
+
+def store_from_uploads(uploads):
+    """uploads = {kind: [UploadedFile, ...]}. Replaces everything saved."""
+    if not all(uploads.get(k) for k in FOLDER_NAMES):
+        return None, "Add files for all three sources first."
+    store_clear()
+    for k, fl in uploads.items():
+        os.makedirs(store_path(k), exist_ok=True)
+        for u in fl:
+            with open(os.path.join(store_path(k), os.path.basename(u.name)), "wb") as out:
+                shutil.copyfileobj(u, out, 1 << 20)
+    _store_meta("uploaded files")
+    return {k: len(v) for k, v in uploads.items()}, None
+# ==============================================================================
 # 3. ZABBIX AUDIT EXPORTS  (hourly CPU / memory / disk per host, alert events, audit summary)
 # ==============================================================================
 _FS_RE = re.compile(r"^FS \[(.*)\]: Space: (Total|Used, in %)$")
@@ -1315,6 +1409,210 @@ def build_model(base, cfg, year=DEFAULT_YEAR, progress=None):
     M["services"] = service_matrix(M)
     return M
 # ==============================================================================
+# 5b. MONTH-ON-MONTH COMPARISON  (what changed between two billed months, and why)
+# ==============================================================================
+def _dims(r):
+    return f"{r['vcpu']:.0f} vCPU · {r['ram']:.0f} GB RAM · {r['hdd']:.0f} GB disk"
+
+
+def _dim_change(a, b):
+    """'vCPU 8→16 · RAM 16→32 GB' for the dimensions that differ, plus +1/-1/0 signs."""
+    out, ups, downs = [], 0, 0
+    for k, lab, unit in (("vcpu", "vCPU", ""), ("ram", "RAM", " GB"), ("hdd", "Disk", " GB")):
+        x, y = a[k], b[k]
+        if x == x and y == y and abs(x - y) > 0.5:
+            out.append(f"{lab} {x:.0f}→{y:.0f}{unit}")
+            ups += y > x
+            downs += y < x
+    return " · ".join(out), ups, downs
+
+
+def _zbx_cfg(aud, host, month):
+    """(RAM GB, disk GB) Zabbix last saw for a host in a month."""
+    end = pd.Period(month).end_time
+    ram = aud["ramtot"][(aud["ramtot"]["host"] == host) & (aud["ramtot"]["date"] <= end) & (aud["ramtot"]["date"] >= end - pd.Timedelta(days=45))] if len(aud.get("ramtot", [])) else None
+    fs = aud["fs"][(aud["fs"]["host"] == host) & (aud["fs"]["date"] <= end) & (aud["fs"]["date"] >= end - pd.Timedelta(days=45))] if len(aud.get("fs", [])) else None
+    r = float(ram.sort_values("date")["ram_gb"].iloc[-1]) if ram is not None and len(ram) else np.nan
+    d = np.nan
+    if fs is not None and len(fs):
+        last = fs["date"].max()
+        d = float(fs[fs["date"] == last].drop_duplicates("mount")["total_gb"].sum())
+    return r, d
+
+
+def month_compare(M, m0, m1):
+    """Everything that changed between billed months m0 and m1, per server, with a driver (reason) for every rupee."""
+    ws, wsh, az, cfg = M["ws"], M["wsh"], M["az"], M["cfg"]
+    azc = 1 - cfg["azure_discount"]
+    drivers = []      # (provider, driver, effect, good_when_negative)
+    web_rows, az_rows, sh_rows = [], [], []
+
+    # ---------------- Webber servers
+    def snap(m):
+        d = ws[ws["month"] == m].sort_values("end")
+        if not len(d):
+            return pd.DataFrame()
+        last = d.groupby("ip").tail(1).set_index("ip")[["host", "category", "vcpu", "ram", "hdd", "rate", "disc"]]
+        last["cost"] = d.groupby("ip")["net"].sum()
+        last["days"] = d.groupby("ip")["days"].sum().clip(upper=31)
+        return last
+    A, B = snap(m0), snap(m1)
+    for ip in sorted(set(A.index) | set(B.index)):
+        a = A.loc[ip] if ip in A.index else None
+        b = B.loc[ip] if ip in B.index else None
+        if a is None:
+            part = f" Billed {b['days']:.0f} days in {month_label(m1)}; full month is {inr(b['rate'])}." if b["days"] < 28 else ""
+            web_rows.append({"server": b["host"], "line": b["category"], "driver": "New server", "before": 0.0, "after": b["cost"], "change": b["cost"],
+                             "what": f"Added: {_dims(b)}.{part}"})
+            drivers.append(("Webber", "New servers", b["cost"], True))
+        elif b is None:
+            part = f" It was billed {a['days']:.0f} days in {month_label(m0)}." if a["days"] < 28 else ""
+            web_rows.append({"server": a["host"], "line": a["category"], "driver": "Removed server", "before": a["cost"], "after": 0.0, "change": -a["cost"],
+                             "what": f"No longer billed ({_dims(a)}).{part}"})
+            drivers.append(("Webber", "Servers removed", -a["cost"], True))
+        else:
+            delta = b["cost"] - a["cost"]
+            if abs(delta) < 1:
+                continue
+            conf = b["rate"] - a["rate"]               # change in full-month price at month end
+            tim = delta - conf                          # part-month billing left over
+            txt, ups, downs = _dim_change(a, b)
+            ren = f"Server renamed or replaced ({a['host']} → {b['host']}). " if str(a["host"]).strip().lower() != str(b["host"]).strip().lower() else ""
+            if abs(conf) < 1:
+                drv, name = "Part-month billing", "Timing (part-month billing)"
+                what = f"Same size and price; billed {a['days']:.0f} days in {month_label(m0)} and {b['days']:.0f} in {month_label(m1)}."
+                tim, conf = delta, 0.0
+            elif txt and ups and not downs and conf > 0:
+                drv, name = "Capacity upgrade", "Capacity upgrades (RAM / CPU / storage)"
+                what = f"Upgraded: {txt}. Full-month price {inr(a['rate'])} → {inr(b['rate'])}."
+            elif txt and downs and not ups and conf < 0:
+                drv, name = "Downsized", "Downsizing / optimisation"
+                what = f"Reduced: {txt}. Full-month price {inr(a['rate'])} → {inr(b['rate'])}."
+            elif txt:
+                drv, name = "Reconfigured", "Capacity upgrades (RAM / CPU / storage)" if conf > 0 else "Downsizing / optimisation"
+                what = f"Changed: {txt}. Full-month price {inr(a['rate'])} → {inr(b['rate'])}."
+            elif str(a["disc"]) != str(b["disc"]):
+                drv, name = "Discount change", "Price / discount changes"
+                what = f"Same size; 40% discount {'applied' if str(b['disc']).lower().startswith('y') else 'removed'}. Full-month price {inr(a['rate'])} → {inr(b['rate'])}."
+            else:
+                drv, name = "Price change", "Price / discount changes"
+                what = f"Same size; full-month price {inr(a['rate'])} → {inr(b['rate'])}."
+            if abs(tim) >= 1 and conf != 0:
+                what += f" Part-month billing adds {inr(tim)} this month."
+            web_rows.append({"server": b["host"], "line": b["category"], "driver": drv, "before": a["cost"], "after": b["cost"], "change": delta, "what": ren + what})
+            if conf:
+                drivers.append(("Webber", name, conf, True))
+            if tim and abs(tim) >= 1:
+                drivers.append(("Webber", "Timing (part-month billing)", tim, True))
+
+    # ---------------- Webber shared lines (backup, Kubernetes, firewall, IPs ...)
+    if len(wsh):
+        def sk(m):
+            d = wsh[wsh["month"] == m]
+            g = d.groupby("kind").agg(cost=("net", "sum"), count=("count", "max"), n=("item", "size"))
+            return g
+        SA, SB = sk(m0), sk(m1)
+        for k in sorted(set(SA.index) | set(SB.index)):
+            a = SA.loc[k] if k in SA.index else None
+            b = SB.loc[k] if k in SB.index else None
+            c0 = a["cost"] if a is not None else 0.0
+            c1 = b["cost"] if b is not None else 0.0
+            if abs(c1 - c0) < 1:
+                continue
+            if a is None:
+                what, drv = f"New charge in {month_label(m1)}.", "New service line"
+            elif b is None:
+                what, drv = f"No longer billed in {month_label(m1)}.", "Service line stopped"
+            else:
+                q0, q1 = a["count"], b["count"]
+                if q0 == q0 and q1 == q1 and q0 != q1:
+                    what, drv = f"Quantity {q0:,.0f} → {q1:,.0f}.", "Quantity change"
+                elif a["n"] != b["n"]:
+                    what, drv = f"{a['n']} → {b['n']} billed items.", "Quantity change"
+                else:
+                    what, drv = "Same quantity, different price or billing days.", "Price change"
+            sh_rows.append({"server": k, "line": "Shared", "driver": drv, "before": c0, "after": c1, "change": c1 - c0, "what": what})
+            drivers.append(("Webber", "Shared services (backup, Kubernetes, firewall, IPs)", c1 - c0, True))
+
+    # ---------------- Azure resources
+    zh = {}
+    H = M["hosts"]
+    if len(H):
+        for _, h in H[H["provider"] == "Azure"].iterrows():
+            zh[h["bill_id"]] = h["host"]
+    c = az[az["month"].isin([m0, m1])].copy()
+    # snapshots carry a timestamp in the name and disks a random id: group them per family so a rolling backup is not "new" and "removed" every day
+    c["resource"] = c["resource"].astype(str).str.replace(r"_at_\d{4}-\d{2}-\d{2}.*$", "", regex=True).str.replace(r"_[0-9a-f]{32}$", "", regex=True)
+    g = c.groupby(["resource", "rtype", "product", "month"]).agg(cost=("cost", "sum"), days=("date", "nunique"), first=("date", "min"), last=("date", "max")).reset_index()
+    g["cost"] *= azc
+    P = g.pivot_table(index=["resource", "rtype", "product"], columns="month", values=["cost", "days"], aggfunc="sum").fillna(0)
+    ed = {m: pd.Period(m).end_time.normalize() for m in (m0, m1)}
+    st_ = {m: pd.Period(m).start_time for m in (m0, m1)}
+    fl = g.set_index(["resource", "rtype", "product", "month"])[["first", "last"]]
+    for (res, rt, prod), r in P.iterrows():
+        c0, c1, d0, d1 = r[("cost", m0)], r[("cost", m1)], r[("days", m0)], r[("days", m1)]
+        if abs(c1 - c0) < 1:
+            continue
+        lab = f"{rt}, {prod}"
+        if c0 == 0:
+            az_rows.append({"server": res, "line": lab, "driver": "New resource", "before": 0.0, "after": c1, "change": c1, "what": f"New {rt} in {month_label(m1)} ({d1:.0f} days billed)."})
+            drivers.append(("Azure", "New Azure resources", c1, True))
+        elif c1 == 0:
+            az_rows.append({"server": res, "line": lab, "driver": "Removed resource", "before": c0, "after": 0.0, "change": -c0, "what": f"No longer billed ({rt})."})
+            drivers.append(("Azure", "Azure resources removed", -c0, True))
+        else:
+            a0, a1 = c0 / max(d0, 1), c1 / max(d1, 1)
+            rate_eff = (a1 - a0) * d0
+            day_eff = a1 * (d1 - d0)
+            what = []
+            nm_day = None
+            if abs(a1 / a0 - 1) >= 0.05:
+                z = ""
+                zh_ = zh.get(res)
+                if zh_:
+                    r0, k0 = _zbx_cfg(M["aud"], zh_, m0)
+                    r1, k1 = _zbx_cfg(M["aud"], zh_, m1)
+                    parts = []
+                    if r0 == r0 and r1 == r1 and abs(r1 - r0) / max(r0, 1) > 0.05:
+                        parts.append(f"RAM {r0:.0f}→{r1:.0f} GB")
+                    if k0 == k0 and k1 == k1 and abs(k1 - k0) / max(k0, 1) > 0.05:
+                        parts.append(f"disk {k0:.0f}→{k1:.0f} GB")
+                    if parts:
+                        z = " Zabbix shows " + ", ".join(parts) + "."
+                verb = "Higher" if a1 > a0 else "Lower"
+                what.append(f"{verb} cost per day ({inr(a0)} → {inr(a1)}): usage, size or price change.{z}")
+                drivers.append(("Azure", "Azure usage / size increases" if rate_eff > 0 else "Azure usage / size reductions (optimisation)", rate_eff, True))
+            else:
+                day_eff = c1 - c0
+            if abs(day_eff) >= 1:
+                f1, l1 = fl.loc[(res, rt, prod, m1)] if (res, rt, prod, m1) in fl.index else (None, None)
+                if l1 is not None and day_eff < 0 and l1 < ed[m1] - pd.Timedelta(days=1):
+                    what.append(f"Stopped billing after {l1:%d %b} ({d1:.0f} days in {month_label(m1)} vs {d0:.0f}): switched off or deleted part-way.")
+                    nm = "Azure resources stopped part-way through the month"
+                elif f1 is not None and day_eff > 0 and f1 > st_[m1] + pd.Timedelta(days=1):
+                    what.append(f"Started on {f1:%d %b} ({d1:.0f} days in {month_label(m1)} vs {d0:.0f}).")
+                    nm = "Azure resources started part-way through the month"
+                else:
+                    what.append(f"Billed {d0:.0f} days in {month_label(m0)} vs {d1:.0f} in {month_label(m1)}.")
+                    nm = "Azure timing (days in the month)"
+                drivers.append(("Azure", nm, day_eff, True))
+                nm_day = nm
+            drv = "Usage / size change" if abs(a1 / a0 - 1) >= 0.05 else ("Days in month" if abs(d1 - d0) <= 1 else "Part-month billing")
+            if nm_day and abs(day_eff) > abs(rate_eff):
+                drv = "Stopped part-way" if "stopped" in nm_day else ("Started part-way" if "started" in nm_day else "Days in month")
+            az_rows.append({"server": res, "line": lab, "driver": drv, "before": c0, "after": c1, "change": c1 - c0, "what": " ".join(what)})
+
+    D = pd.DataFrame(drivers, columns=["provider", "driver", "effect", "x"]).groupby(["provider", "driver"], as_index=False).agg(effect=("effect", "sum"), n=("effect", "size"))
+    D["effect"] = D["effect"].round(2)
+    W = pd.DataFrame(web_rows + sh_rows)
+    Z = pd.DataFrame(az_rows)
+    for d in (W, Z):
+        if len(d):
+            d.sort_values("change", key=lambda s: -s.abs(), inplace=True)
+    T = M["monthly"].set_index("month")
+    return {"m0": m0, "m1": m1, "drivers": D, "webber": W.reset_index(drop=True), "azure": Z.reset_index(drop=True),
+            "azure0": T.loc[m0, "azure_net"], "azure1": T.loc[m1, "azure_net"], "webber0": T.loc[m0, "webber"], "webber1": T.loc[m1, "webber"]}
+# ==============================================================================
 # 6. LOOK & FEEL  (white, slate + dark maroon)
 # ==============================================================================
 LIGHT_THEME = {"base": "light", "primaryColor": "#7a1c1c", "backgroundColor": "#ffffff",
@@ -1504,6 +1802,11 @@ CSS2 = f"""
 <style>
   .ct-i {{ display:inline-block; cursor: help; color: {PAL['slate']}; font-size: .95rem; font-weight: 600; margin-left: 4px; }}
   .ct-kpi {{ min-height: 238px; }}
+  .ct-up {{ color: {PAL['maroon']}; font-weight: 800; white-space: nowrap; }}
+  .ct-down {{ color: {PAL['good']}; font-weight: 800; white-space: nowrap; }}
+  .ct-flat {{ color: {PAL['grey']}; }}
+  table.ct-plan td.what {{ color: {PAL['muted']}; font-size: .88rem; }}
+  .ct-delta {{ font-size: 1.05rem; font-weight: 700; margin-top: .25rem; }}
   .ct-m {{ margin-top: .55rem; padding-top: .45rem; border-top: 1px dashed {PAL['line']}; font-size: .86rem; line-height: 1.4; color: {PAL['text']}; }}
   table.ct-plan {{ width: 100%; border-collapse: collapse; font-size: .93rem; margin: .3rem 0 .6rem 0; }}
   table.ct-plan th {{ text-align: left; color: {PAL['muted']}; font-weight: 600; font-size: .8rem; padding: 8px 10px; border-bottom: 2px solid {PAL['line']}; }}
@@ -1920,15 +2223,208 @@ def tab_evidence(M):
                     f"- **Not in the data:** Azure data-transfer and licence meters, WebberStop quotes for new servers, vCPU counts of Azure servers, compliance status of any workload.")
 
 
+
+# ------------------------------------------------------------------------------ Trends tab
+def _icon(v):
+    if abs(v) < 1:
+        return '<span class="ct-flat">&#9679;</span>'
+    return '<span class="ct-down">&#10004; &#9660;</span>' if v < 0 else '<span class="ct-up">&#9650;</span>'
+
+
+def _chg(v, base=None):
+    pct = f" ({v / base:+.1%})" if base else ""
+    cls = "ct-down" if v < -1 else ("ct-up" if v > 1 else "ct-flat")
+    sign = "+" if v > 0 else ("-" if v < 0 else "")
+    return f'<span class="{cls}">{sign}{inr(abs(v))}{pct}</span>'
+
+
+def trend_tile(label, prev, cur, m0, m1):
+    d = cur - prev
+    return (f'<div class="ct-kpi {"good" if d < -1 else "accent" if d > 1 else ""}"><div class="ct-l">{esc(label)}</div><div class="ct-v">{inr(cur)}</div>'
+            f'<div class="ct-s">{month_label(m0)} {inr(prev)} → {month_label(m1)} {inr(cur)}</div>'
+            f'<div class="ct-delta">{_icon(d)} {_chg(d, prev)}</div></div>')
+
+
+def trend_notes(C):
+    m0, m1 = month_label(C["m0"]), month_label(C["m1"])
+    D = C["drivers"]
+    out = []
+    t0, t1 = C["azure0"] + C["webber0"], C["azure1"] + C["webber1"]
+    out.append(f"<b>Total cost {'rose' if t1 > t0 else 'fell'} by {inr(abs(t1 - t0))} ({(t1 / t0 - 1):+.1%})</b> from {m0} to {m1}: {inr(t0)} → {inr(t1)}.")
+    for p, a, b in (("Webber", C["webber0"], C["webber1"]), ("Azure", C["azure0"], C["azure1"])):
+        d = D[D["provider"] == p]
+        if not len(d):
+            continue
+        top = d.reindex(d["effect"].abs().sort_values(ascending=False).index).head(3)
+        parts = "; ".join(f"{r['driver'].lower()} {'+' if r['effect'] > 0 else '-'}{inr(abs(r['effect']))}" + (f" ({int(r['n'])})" if r["n"] > 1 else "") for _, r in top.iterrows())
+        out.append(f"<b>{'WebberStop' if p == 'Webber' else 'Azure'} {'up' if b > a else 'down'} {inr(abs(b - a))}.</b> Largest drivers: {parts}.")
+    return out
+
+
+def _chg_table(df, n=12):
+    if not len(df):
+        return "<p class='ct-note'>No changes.</p>"
+    rows = ['<table class="ct-plan"><thead><tr><th></th><th>Server / resource</th><th>What changed</th><th class="n">Before</th><th class="n">After</th><th class="n">Change</th></tr></thead><tbody>']
+    for _, r in df.head(n).iterrows():
+        rows.append(f'<tr><td>{_icon(r["change"])}</td><td><b>{esc(r["server"])}</b><br><span class="ct-note">{esc(r["line"])}</span></td>'
+                    f'<td class="what"><b>{esc(r["driver"])}.</b> {esc(r["what"])}</td><td class="n">{inr(r["before"])}</td><td class="n">{inr(r["after"])}</td><td class="n">{_chg(r["change"])}</td></tr>')
+    rows.append("</tbody></table>")
+    return "".join(rows)
+
+
+def _drivers_table(D, p):
+    d = D[D["provider"] == p].copy()
+    if not len(d):
+        return ""
+    d = d.reindex(d["effect"].abs().sort_values(ascending=False).index)
+    rows = ['<table class="ct-plan"><thead><tr><th></th><th>Reason</th><th class="n">Servers / items</th><th class="n">Effect on monthly cost</th></tr></thead><tbody>']
+    for _, r in d.iterrows():
+        rows.append(f'<tr><td>{_icon(r["effect"])}</td><td><b>{esc(r["driver"])}</b></td><td class="n">{int(r["n"])}</td><td class="n">{_chg(r["effect"])}</td></tr>')
+    rows.append("</tbody></table>")
+    return "".join(rows)
+
+
+def trend_report(C):
+    buf = io.BytesIO()
+    t0, t1 = C["azure0"] + C["webber0"], C["azure1"] + C["webber1"]
+    m0_, m1_ = month_label(C["m0"]), month_label(C["m1"])
+    S = pd.DataFrame([{"Provider": "Total", m0_: t0, m1_: t1, "Change": t1 - t0}, {"Provider": "Azure", m0_: C["azure0"], m1_: C["azure1"], "Change": C["azure1"] - C["azure0"]},
+                      {"Provider": "WebberStop", m0_: C["webber0"], m1_: C["webber1"], "Change": C["webber1"] - C["webber0"]}])
+    cols = {"server": "Server / resource", "line": "Line / type", "driver": "Reason", "before": "Before", "after": "After", "change": "Change", "what": "What changed"}
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        S.to_excel(xw, sheet_name="Summary", index=False)
+        C["drivers"].rename(columns={"provider": "Provider", "driver": "Reason", "effect": "Effect on monthly cost", "n": "Servers / items"}).to_excel(xw, sheet_name="Reasons", index=False)
+        C["webber"].rename(columns=cols).to_excel(xw, sheet_name="WebberStop changes", index=False)
+        C["azure"].rename(columns=cols).to_excel(xw, sheet_name="Azure changes", index=False)
+    return buf.getvalue()
+
+
+def tab_trends(M):
+    months = M["months"]
+    if len(months) < 2:
+        st.info("Trends need at least two billed months.")
+        return
+    c1, c2, _ = st.columns([1, 1, 3])
+    m0 = c1.selectbox("From", months, index=len(months) - 2, format_func=month_label, key="tr_m0")
+    m1 = c2.selectbox("To", months, index=len(months) - 1, format_func=month_label, key="tr_m1")
+    if m0 >= m1:
+        st.warning("Pick a 'From' month earlier than the 'To' month.")
+        return
+    key = ("cmp", id(M), m0, m1)
+    if key not in st.session_state:
+        for k in [k for k in st.session_state if isinstance(k, tuple) and k and k[0] == "cmp"]:
+            del st.session_state[k]
+        st.session_state[key] = month_compare(M, m0, m1)
+    C = st.session_state[key]
+    t0, t1 = C["azure0"] + C["webber0"], C["azure1"] + C["webber1"]
+    c = st.columns(3)
+    c[0].markdown(trend_tile("Total cost", t0, t1, m0, m1), unsafe_allow_html=True)
+    c[1].markdown(trend_tile("WebberStop", C["webber0"], C["webber1"], m0, m1), unsafe_allow_html=True)
+    c[2].markdown(trend_tile("Azure", C["azure0"], C["azure1"], m0, m1), unsafe_allow_html=True)
+    st.caption("&#10004; &#9660; green = cost fell · &#9650; red = cost rose. Colour follows the effect on cost, so a planned capacity upgrade also shows red.")
+    st.markdown("##### Summary for management")
+    for f in trend_notes(C):
+        st.markdown(f'<div class="ct-find">{f}</div>', unsafe_allow_html=True)
+    D = C["drivers"].copy()
+    D["label"] = D["provider"].map({"Webber": "WebberStop", "Azure": "Azure"}) + ": " + D["driver"]
+    D = D.reindex(D["effect"].abs().sort_values(ascending=False).index).head(14).sort_values("effect", ascending=False)
+    fig = go.Figure(go.Waterfall(x=list(D["label"]) + ["Net change"], y=list(D["effect"]) + [0], measure=["relative"] * len(D) + ["total"],
+                                 text=[("+" if v > 0 else "-") + inr(abs(v)) for v in D["effect"]] + [""], textposition="outside",
+                                 increasing=dict(marker=dict(color=PAL["maroon"])), decreasing=dict(marker=dict(color=PAL["good"])), totals=dict(marker=dict(color=PAL["slate_d"])),
+                                 connector=dict(line=dict(color=PAL["line"]))))
+    fig = style_fig(fig, 420, False, f"Why cost changed, {month_label(m0)} → {month_label(m1)} (red adds cost, green removes it)")
+    fig.update_xaxes(tickangle=-30)
+    fig.update_traces(cliponaxis=False)
+    cs = np.cumsum(D["effect"].values)
+    rupee_axis(fig, max(float(cs.max()), float(D["effect"].sum()), 1) * 1.25, min(float(cs.min()) * 1.25, 0))
+    st.plotly_chart(fig, **STRETCH)
+    w, a = st.tabs(["WebberStop", "Azure"])
+    for tab, key_, nm in ((w, "webber", "Webber"), (a, "azure", "Azure")):
+        with tab:
+            st.markdown(f"**Reasons**")
+            st.markdown(_drivers_table(C["drivers"], nm), unsafe_allow_html=True)
+            st.markdown("**Largest changes, server by server**")
+            R_ = C[key_]
+            st.markdown(_chg_table(R_), unsafe_allow_html=True)
+            if len(R_) > 12:
+                with st.expander(f"All {len(R_)} changes"):
+                    opts = sorted(R_["driver"].unique())
+                    pick = st.multiselect("Reason", opts, default=opts, key="trf_" + key_)
+                    q = R_[R_["driver"].isin(pick)].rename(columns={"server": "Server / resource", "line": "Line / type", "driver": "Reason", "before": "Before", "after": "After", "change": "Change", "what": "What changed"})
+                    table(q, money_cols=("Before", "After", "Change"), names={c_: c_ for c_ in q.columns})
+    T = M["monthly"]
+    ch = T["total"].diff().iloc[1:]
+    fig = go.Figure(go.Bar(x=[month_label(m) for m in T["month"].iloc[1:]], y=ch, marker_color=[PAL["good"] if v < 0 else PAL["maroon"] for v in ch],
+                           text=[("+" if v > 0 else "-") + inr(abs(v)) for v in ch], textposition="outside"))
+    fig = style_fig(fig, 300, False, "Month-on-month change in total cost (green = fell, red = rose)")
+    fig.update_traces(cliponaxis=False)
+    rupee_axis(fig, max(float(ch.max()), 1) * 1.3, min(float(ch.min()) * 1.3, -1))
+    st.plotly_chart(fig, **STRETCH)
+    st.download_button("Download this comparison for the management report (Excel)", trend_report(C), file_name=f"cost_trend_{m0}_to_{m1}.xlsx", key="dl_trend")
+
+
+def ensure_server_config():
+    """Allow large uploads (Zabbix hourly files are big). Takes effect the next time Streamlit starts."""
+    path = os.path.join(".streamlit", "config.toml")
+    try:
+        old = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+        if "maxUploadSize" not in old:
+            os.makedirs(".streamlit", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(("\n" if old and not old.endswith("\n") else "") + "\n[server]\nmaxUploadSize = 4096\n")
+    except OSError:
+        pass
+
+
+def data_sidebar(sb, base):
+    """Saved data: status, save from the input folder, or replace with uploads. Every save replaces everything."""
+    info = store_info()
+    sb.markdown("### Saved data")
+    if info["ready"]:
+        k = info["kinds"]
+        sb.success(f"Using saved data ({info['source']}, {info['saved_at']}): {k['azure']['files']} Azure, {k['webber']['files']} WebberStop and {k['zabbix']['files']} Zabbix files.")
+    else:
+        sb.info("Nothing saved yet: the app reads the input folder directly. Save once so the data stays available.")
+    n = st.session_state.setdefault("up_n", 0)
+    with sb.expander("Save or replace the data", expanded=not info["ready"]):
+        st.caption("Each save **replaces everything** stored, so the app always holds one clean, current set.")
+        if st.button("Save the files from the input folder", key="save_folder"):
+            with st.spinner("Saving…"):
+                res, err = store_from_folder(base)
+            if err:
+                st.error(err)
+            else:
+                st.cache_resource.clear()
+                st.rerun()
+        st.markdown("**or upload files**")
+        ua = st.file_uploader("Azure cost files (.xlsx)", accept_multiple_files=True, type=["xlsx", "xls", "xlsm"], key=f"up_az_{n}")
+        uw = st.file_uploader("WebberStop bills (.xls / .xlsx)", accept_multiple_files=True, type=["xls", "xlsx"], key=f"up_wb_{n}")
+        uz = st.file_uploader("Zabbix audit exports (.csv)", accept_multiple_files=True, type=["csv"], key=f"up_zb_{n}")
+        st.caption("Zabbix hourly files are large (hundreds of MB each); saving from the input folder is faster than uploading them.")
+        if st.button("Replace saved data with these uploads", key="save_up", disabled=not (ua and uw and uz)):
+            with st.spinner("Saving…"):
+                res, err = store_from_uploads({"azure": ua, "webber": uw, "zabbix": uz})
+            if err:
+                st.error(err)
+            else:
+                st.session_state["up_n"] = n + 1
+                st.cache_resource.clear()
+                st.rerun()
+    return info
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="₹", layout="wide")
     ensure_theme_file()
+    ensure_server_config()
     st.markdown(CSS + CSS2, unsafe_allow_html=True)
     sb = st.sidebar
-    sb.markdown("### Inputs")
-    base = sb.text_input("Folder holding the three input folders", value=st.session_state.get("base", default_base()), key="base_in")
-    st.session_state["base"] = base
-    sb.caption("Reads: Azure Cost Logs · Webber Cost Logs · Zabbix Logs. All limits are fixed from the data and listed under Evidence → Limits and assumptions.")
+    sb.markdown("### Input folder")
+    inbase = sb.text_input("Folder holding Azure Cost Logs, Webber Cost Logs and Zabbix Logs", value=st.session_state.get("base", default_base()), key="base_in")
+    st.session_state["base"] = inbase
+    sb.caption("Used when nothing is saved, and as the source for 'Save the files from the input folder'. Limits are fixed from the data (Evidence → Limits and assumptions).")
+    data_sidebar(sb, inbase)
+    base = active_base(inbase)
     if sb.button("Re-read all files"):
         st.cache_resource.clear()
     cfg = dict(DEFAULT_CFG)
@@ -1947,12 +2443,14 @@ def main():
     zs = M["aud"].get("span")
     st.markdown(f'<div class="ct-sub">Cost {T.iloc[0]["label"]} – {T.iloc[-1]["label"]}'
                 + (f' · Zabbix utilisation {zs[0]:%d %b} – {zs[1]:%d %b %Y}' if zs else " · no Zabbix utilisation data") + "</div>", unsafe_allow_html=True)
-    t = st.tabs(["Overview", "Action plan", "Evidence"])
+    t = st.tabs(["Overview", "Trends", "Action plan", "Evidence"])
     with t[0]:
         tab_overview(M)
     with t[1]:
-        tab_plan(M)
+        tab_trends(M)
     with t[2]:
+        tab_plan(M)
+    with t[3]:
         tab_evidence(M)
 
 
